@@ -16,14 +16,16 @@ The public selected-row interface has 16 row slots. TP1 selects and projects
 locally. TP groups gather owner rows and exchange vocabulary shards within
 that group, then retire communication signals after all readers complete.
 Complete a dispatch on every rank before replacing shared inputs or reusing
-its windows. The DSpark target consumes a separate 80-row masked batch.
+its windows. DSpark sampling applies token and width masks directly to its 72 output IDs.
 """
 
 import sys
+from pathlib import Path
 
 import pypto.language as pl
 import pypto.language.distributed as pld
 from pypto.ir import DistributedConfig
+from pypto.runtime import pto_isa_include_dir
 
 # Standalone LM-head validation defaults to TP2/DP1.
 
@@ -37,7 +39,6 @@ from quant import pack_bf16_nz, unpack_bf16_nz
 D = M.hidden_size
 VOCAB = M.vocab_size
 LM_HEAD_WEIGHT_LAYOUT = "bf16_nz_kn"
-LM_HEAD_WEIGHT_CACHE = getattr(pl.CachePolicy, "NOT_ALLOC_KEEP", pl.CachePolicy.DEFAULT)
 
 
 T_DYN = pl.dynamic("LM_HEAD_T_DYN")
@@ -72,14 +73,10 @@ TEST_TOKENS = 16  # standalone fixture: hidden rows per card
 GROUP_LOGIT_ROWS = TP_SIZE * MAX_LOGIT_ROWS
 
 # Tiling
-FUSED_K_TILE = 128
-FUSED_VOCAB_TILE = 512 if TP_SIZE < 8 else 256
 LM_HEAD_M_TILE = 80
-LM_HEAD_STAGE = 3
 GROUP_M_TILE = min(LM_HEAD_M_TILE, GROUP_LOGIT_ROWS)
 HIDDEN_GATHER_TILE = 512
 LOGITS_COMM_TILE = 2048
-VOCAB_TAIL = VOCAB_PER_TP % FUSED_VOCAB_TILE
 LOGITS_COMM_TAIL = VOCAB_PER_TP % LOGITS_COMM_TILE
 FUSED_LM_HEAD_CORES = 32
 # Repeated projections advance epochs and clear signals after the final projection.
@@ -105,7 +102,6 @@ LOGITS_COMM_BLOCKS = min(
 )
 LOGITS_TAIL_BLOCK = N_LOGITS_COMM_TILES % LOGITS_COMM_BLOCKS
 
-assert D % FUSED_K_TILE == 0
 assert D % HIDDEN_GATHER_TILE == 0
 assert VOCAB % TP_SIZE == 0
 assert GROUP_LOGIT_ROWS % 16 == 0, "matmul M extent must be a multiple of 16"
@@ -114,30 +110,18 @@ assert DP_SIZE in _DP_CHOICES, f"--dp must be one of {_DP_CHOICES} (got {DP_SIZE
 assert REPEAT in _REPEAT_CHOICES, f"--repeat must be one of {_REPEAT_CHOICES} (got {REPEAT})"
 
 
-@pl.jit.inline(auto_scope=False)
-def _lm_head_project_tile(
+@pl.jit.extern(core_type="aic", source=Path(__file__).parent / "kernels" / "lm_head_projection.cpp",
+               include_dirs=(pto_isa_include_dir(),))
+def _lm_head_projection(
     hidden_states: pl.Tensor,
-    lm_head_weight: pl.Tensor[[D, VOCAB_PER_TP], pl.BF16, pl.NZ],
-    row: pl.Scalar[pl.INDEX],
-    col: pl.Scalar[pl.INDEX],
-    valid_rows: pl.Scalar[pl.INDEX],
-    m_tile: pl.constexpr,
-    n_tile: pl.constexpr,
-):
-    first_a = pl.load(hidden_states, [row, 0], [m_tile, FUSED_K_TILE],
-                      valid_shape=[valid_rows, FUSED_K_TILE], target_memory=pl.Mem.Mat)
-    first_a_full = pl.set_validshape(first_a, m_tile, FUSED_K_TILE)
-    first_b = pl.load(lm_head_weight, [0, col], [FUSED_K_TILE, n_tile],
-                      target_memory=pl.Mem.Mat, cache=LM_HEAD_WEIGHT_CACHE)
-    accum = pl.matmul(first_a_full, first_b, out_dtype=pl.FP32)
-    for k in pl.pipeline(FUSED_K_TILE, D, FUSED_K_TILE, stage=LM_HEAD_STAGE):
-        a = pl.load(hidden_states, [row, k], [m_tile, FUSED_K_TILE],
-                    valid_shape=[valid_rows, FUSED_K_TILE], target_memory=pl.Mem.Mat)
-        a_full = pl.set_validshape(a, m_tile, FUSED_K_TILE)
-        b = pl.load(lm_head_weight, [k, col], [FUSED_K_TILE, n_tile],
-                    target_memory=pl.Mem.Mat, cache=LM_HEAD_WEIGHT_CACHE)
-        accum = pl.matmul_acc(accum, a_full, b)
-    return accum
+    lm_head_weight: pl.Tensor,
+    logits: pl.Out[pl.Tensor],
+    rows: pl.Scalar[pl.INDEX],
+    vocabulary: pl.Scalar[pl.INDEX],
+    row_tile: pl.Scalar[pl.INDEX],
+) -> pl.Tensor:
+    """Project BF16 hidden states against packed NZ vocabulary weights."""
+    ...
 
 
 @pl.jit.inline(auto_scope=False)
@@ -150,31 +134,7 @@ def lm_head_project(
     """Write vocabulary logits in place and return the completion task."""
     rows = pl.tensor.dim(logits, 0)
     with pl.spmd(FUSED_LM_HEAD_CORES, name_hint="lm_head_matmul") as projected:
-        worker = pl.tile.get_block_idx()
-        for row in pl.range(0, rows, m_tile):
-            valid_rows = pl.min(m_tile, rows - row)
-            tile_count = (VOCAB_PER_TP // FUSED_VOCAB_TILE + FUSED_LM_HEAD_CORES - 1 - worker) // FUSED_LM_HEAD_CORES
-            accum = pl.tile.create([m_tile, FUSED_VOCAB_TILE], dtype=pl.FP32)
-            for step in pl.pipeline(0, tile_count * (D // FUSED_K_TILE), 1, stage=LM_HEAD_STAGE):
-                k = step % (D // FUSED_K_TILE) * FUSED_K_TILE
-                col = (worker + step // (D // FUSED_K_TILE) * FUSED_LM_HEAD_CORES) * FUSED_VOCAB_TILE
-                a = pl.load(hidden_states, [row, k], [m_tile, FUSED_K_TILE],
-                            valid_shape=[valid_rows, FUSED_K_TILE], target_memory=pl.Mem.Mat)
-                a_full = pl.set_validshape(a, m_tile, FUSED_K_TILE)
-                b = pl.load(lm_head_weight, [k, col], [FUSED_K_TILE, FUSED_VOCAB_TILE],
-                            target_memory=pl.Mem.Mat, cache=LM_HEAD_WEIGHT_CACHE)
-                accum = pl.matmul_acc(accum, a_full, b, init_cond=(k == 0))
-                if k + FUSED_K_TILE == D:
-                    valid_accum = pl.set_validshape(accum, valid_rows, FUSED_VOCAB_TILE)
-                    logits = pl.store(valid_accum, [row, col], logits)
-            if VOCAB_TAIL != 0:
-                if worker == (VOCAB_PER_TP // FUSED_VOCAB_TILE) % FUSED_LM_HEAD_CORES:
-                    col = VOCAB_PER_TP // FUSED_VOCAB_TILE * FUSED_VOCAB_TILE
-                    tail_accum = _lm_head_project_tile(
-                        hidden_states, lm_head_weight, row, col, valid_rows, m_tile, VOCAB_TAIL,
-                    )
-                    valid_tail = pl.set_validshape(tail_accum, valid_rows, VOCAB_TAIL)
-                    logits = pl.store(valid_tail, [row, col], logits)
+        _lm_head_projection(hidden_states, lm_head_weight, logits, rows, VOCAB_PER_TP, m_tile)
     return projected
 
 
@@ -456,16 +416,50 @@ def greedy_sample(
     return sampled_ids
 
 
+@pl.jit.extern(core_type="mixed", aic_source=Path(__file__).parent / "kernels" / "lm_head_sample.cpp",
+               aiv_source=Path(__file__).parent / "kernels" / "lm_head_sample.cpp",
+               dual_aiv_dispatch=True, include_dirs=(pto_isa_include_dir(),))
+def _lm_head_sample_partial(
+    hidden_states: pl.Tensor,
+    lm_head_weight: pl.Tensor,
+    partial_values: pl.Out[pl.Tensor],
+    partial_indices: pl.Out[pl.Tensor],
+    active_widths: pl.Tensor,
+    rows: pl.Scalar[pl.INDEX],
+) -> tuple[pl.Tensor, pl.Tensor]:
+    return partial_values, partial_indices
+
+
+@pl.jit.extern(core_type="aiv", source=Path(__file__).parent / "kernels" / "lm_head_sample_merge.cpp",
+               include_dirs=(pto_isa_include_dir(),))
+def _lm_head_sample_merge(
+    partial_values: pl.Tensor,
+    partial_indices: pl.Tensor,
+    sampled_ids: pl.Out[pl.Tensor],
+) -> pl.Tensor:
+    ...
+
+
 @pl.jit.inline(auto_scope=False)
 def lm_head_sample(
-    hidden_states: pl.Tensor[[LM_HEAD_M_TILE, D], pl.BF16],
+    hidden_states: pl.Tensor,
     lm_head_weight: pl.Tensor[[D, VOCAB_PER_TP], pl.BF16, pl.NZ],
+    active_widths: pl.Tensor,
     sampled_ids: pl.Tensor,
+    ready: pl.Scalar[pl.TASK_ID] = None,
 ):
-    """Project a masked TP1 batch and select its requested token IDs."""
-    logits = pl.create_tensor([LM_HEAD_M_TILE, VOCAB], dtype=pl.FP32)
-    projected = lm_head_project(hidden_states, lm_head_weight, logits, LM_HEAD_M_TILE)
-    greedy_sample(logits, sampled_ids, projected)
+    """Project and greedily sample the bounded TP1 verification rows."""
+    rows = pl.tensor.dim(sampled_ids, 0)
+    partial_values = pl.create_tensor([FUSED_LM_HEAD_CORES, LM_HEAD_M_TILE], dtype=pl.FP32)
+    partial_indices = pl.create_tensor([FUSED_LM_HEAD_CORES, LM_HEAD_M_TILE], dtype=pl.INT32)
+    with pl.spmd(FUSED_LM_HEAD_CORES, name_hint="lm_head_sample_partial", deps=[ready],
+                 allow_early_resolve=True) as projected:
+        partial_values, partial_indices = _lm_head_sample_partial(
+            hidden_states, lm_head_weight, partial_values, partial_indices, active_widths, rows,
+        )
+    with pl.spmd((rows + SAMPLED_IDS_PAD - 1) // SAMPLED_IDS_PAD,
+                 name_hint="lm_head_sample_merge", deps=[projected]):
+        sampled_ids = _lm_head_sample_merge(partial_values, partial_indices, sampled_ids)
     return sampled_ids
 
 
